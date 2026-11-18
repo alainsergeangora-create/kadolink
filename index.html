@@ -307,7 +307,26 @@ const { useState, useEffect, useRef, useCallback, useMemo, createContext, useCon
 // CONSTANTES
 // ════════════════════════════════════════════════════════════════
 const BRAND = { primary: '#21396D', secondary: '#35A8E0', accent: '#F7D98D' };
-const APP_FOOTER = '© 2026 KadoLink v3.9.1 · Powered by Africa Smart Access (ASA)';
+const APP_FOOTER = '© 2026 KadoLink v3.9.2 · Powered by Africa Smart Access (ASA)';
+
+// ════════════════════════════════════════════════════════════════
+// PAYMENT CONFIG
+// ════════════════════════════════════════════════════════════════
+const PAYMENT_CONFIG = {
+  cinetpay: {
+    apikey:      '14052869565c2b6f692ca27.33945474',
+    site_id:     '498340',
+    notify_url:  'https://europe-west1-docupme-62abb.cloudfunctions.net/flutterwaveRouter',
+    return_url:  window.location.origin + '/?payment=success',
+    cancel_url:  window.location.origin + '/?payment=cancel',
+    mode:        'PRODUCTION',
+  },
+  flutterwave: {
+    public_key:   'FLWPUBK_TEST-SANDBOXDEMOKEY-X',
+    redirect_url: window.location.origin + '/?payment=success',
+    secret_hash:  'FLWSECK_TESTda54a70ff842',
+  },
+};
 
 const PLANS = {
   Free:       { label: 'Free',       emoji: '🆓', price: 0,      maxCards: 50,    maxLots: 2,   maxUsers: 1 },
@@ -315,6 +334,150 @@ const PLANS = {
   Regular:    { label: 'Regular',    emoji: '⭐', price: 24900,  maxCards: 2000,  maxLots: 30,  maxUsers: 10 },
   Pro:        { label: 'Pro',        emoji: '🚀', price: 49900,  maxCards: 10000, maxLots: 100, maxUsers: 25 },
   Enterprise: { label: 'Enterprise', emoji: '🏆', price: null,   maxCards: null,  maxLots: null, maxUsers: null },
+};
+
+// ════════════════════════════════════════════════════════════════
+// PAYMENT HELPERS
+// ════════════════════════════════════════════════════════════════
+
+const makeTxRef = (tenantId, planKey) =>
+  `KADOLINK-${tenantId}-${planKey}-${Date.now()}`;
+
+const makeInvoiceId = (tenantId) =>
+  `INV-KL-${tenantId}-${Date.now()}`;
+
+const loadCinetPaySDK = () => new Promise((resolve, reject) => {
+  if (window.CinetPay) return resolve(window.CinetPay);
+  const s = document.createElement('script');
+  s.src = 'https://cdn.cinetpay.com/seamless/main.js';
+  s.onload = () => resolve(window.CinetPay);
+  s.onerror = reject;
+  document.head.appendChild(s);
+});
+
+const loadFlutterwaveSDK = () => new Promise((resolve, reject) => {
+  if (window.FlutterwaveCheckout) return resolve(window.FlutterwaveCheckout);
+  const s = document.createElement('script');
+  s.src = 'https://checkout.flutterwave.com/v3.js';
+  s.onload = () => resolve(window.FlutterwaveCheckout);
+  s.onerror = reject;
+  document.head.appendChild(s);
+});
+
+const initCinetPay = async (opts, onSuccess, onError) => {
+  const { tenant, planKey, planPrice, userEmail, userName } = opts;
+  try {
+    const CinetPay = await loadCinetPaySDK();
+    const txRef = makeTxRef(tenant.id, planKey);
+    const cfg = PAYMENT_CONFIG.cinetpay;
+    CinetPay.setConfig({
+      apikey:     cfg.apikey,
+      site_id:    cfg.site_id,
+      notify_url: cfg.notify_url,
+      return_url: cfg.return_url,
+      mode:       cfg.mode,
+    });
+    CinetPay.getCheckout({
+      transaction_id: txRef,
+      amount:         planPrice,
+      currency:       'XOF',
+      channels:       'ALL',
+      description:    `KadoLink - Plan ${planKey} (mensuel)`,
+      customer_email: userEmail || '',
+      customer_name:  userName  || tenant.name,
+      metadata:       JSON.stringify({ tenantId: tenant.id, planKey }),
+    });
+    CinetPay.waitResponse(data => {
+      if (data.status === 'ACCEPTED') onSuccess({ txRef, planKey, gateway: 'cinetpay' });
+      else onError(data.message || 'Paiement refusé');
+    });
+    CinetPay.onError(err => onError(err.message || 'Erreur CinetPay'));
+  } catch (e) { onError(e.message || 'Impossible de charger CinetPay'); }
+};
+
+const initFlutterwave = async (opts, onSuccess, onError) => {
+  const { tenant, planKey, planPrice, userEmail, userName } = opts;
+  try {
+    const FlutterwaveCheckout = await loadFlutterwaveSDK();
+    const txRef = makeTxRef(tenant.id, planKey);
+    FlutterwaveCheckout({
+      public_key:      PAYMENT_CONFIG.flutterwave.public_key,
+      tx_ref:          txRef,
+      amount:          planPrice,
+      currency:        'XOF',
+      payment_options: 'card,mobilemoney',
+      redirect_url:    PAYMENT_CONFIG.flutterwave.redirect_url,
+      meta: { tenantId: tenant.id, planKey },
+      customer: {
+        email: userEmail || `tenant-${tenant.id}@kadolink.app`,
+        name:  userName  || tenant.name,
+      },
+      customizations: {
+        title:       'KadoLink',
+        description: `Abonnement Plan ${planKey}`,
+        logo:        'https://kadolink-b8023.web.app/icons/icon-192.png',
+      },
+      callback: (response) => {
+        if (response.status === 'successful') onSuccess({ txRef, planKey, gateway: 'flutterwave', flwRef: response.transaction_id });
+        else onError('Paiement non abouti');
+      },
+      onclose: () => {},
+    });
+  } catch (e) { onError(e.message || 'Impossible de charger Flutterwave'); }
+};
+
+const activatePlanLocally = (tenantId, planKey, txRef) => {
+  const tenants = Storage.gget('tenants') || [];
+  const now = new Date();
+  const nextMonth = new Date(now);
+  nextMonth.setMonth(nextMonth.getMonth() + 1);
+  const invoice = {
+    id:          makeInvoiceId(tenantId),
+    tenantId,
+    planKey,
+    amount:      PLANS[planKey]?.price || 0,
+    currency:    'XOF',
+    txRef,
+    status:      'paid',
+    createdAt:   now.toISOString(),
+    periodStart: now.toISOString(),
+    periodEnd:   nextMonth.toISOString(),
+  };
+  const invoices = Storage.gget('invoices') || [];
+  invoices.push(invoice);
+  Storage.gset('invoices', invoices);
+  const updated = tenants.map(t => t.id !== tenantId ? t : {
+    ...t,
+    plan:            planKey,
+    planActivatedAt: now.toISOString(),
+    planRenewAt:     nextMonth.toISOString(),
+    lastInvoiceId:   invoice.id,
+  });
+  Storage.gset('tenants', updated);
+  return invoice;
+};
+
+const checkAndAutoRenew = (tenant) => {
+  if (!tenant?.planRenewAt || tenant.plan === 'Free') return;
+  const renewAt = new Date(tenant.planRenewAt);
+  if (new Date() >= renewAt) {
+    const invoices = Storage.gget('invoices') || [];
+    if (!invoices.find(i => i.tenantId === tenant.id && i.status === 'pending')) {
+      invoices.push({
+        id:          makeInvoiceId(tenant.id),
+        tenantId:    tenant.id,
+        planKey:     tenant.plan,
+        amount:      PLANS[tenant.plan]?.price || 0,
+        currency:    'XOF',
+        txRef:       null,
+        status:      'pending',
+        createdAt:   new Date().toISOString(),
+        periodStart: renewAt.toISOString(),
+        periodEnd:   new Date(renewAt.getTime() + 30*86400000).toISOString(),
+      });
+      Storage.gset('invoices', invoices);
+    }
+  }
 };
 const today = () => new Date().toISOString().split('T')[0];
 
@@ -3297,44 +3460,110 @@ const TenantsPage = ({ user }) => {
 // SETTINGS PAGE
 // ════════════════════════════════════════════════════════════════
 const UpgradePage = ({ user, setPage }) => {
-  const { tenant } = useApp();
+  const { tenant, setTenant } = useApp();
   const currentPlan = getPlan(tenant);
-  const CONTACT_WA = 'https://wa.me/2250700000000?text=Bonjour%2C%20je%20souhaite%20upgrader%20mon%20plan%20KadoLink';
-  const CONTACT_MAIL = 'mailto:commercial@kadolink.app?subject=Upgrade%20Plan%20KadoLink&body=Bonjour%2C%20je%20souhaite%20upgrader%20mon%20plan.';
+  const [payState,   setPayState]   = React.useState('idle');
+  const [payMsg,     setPayMsg]     = React.useState('');
+  const [payInvoice, setPayInvoice] = React.useState(null);
+  const [gateway,    setGateway]    = React.useState('cinetpay');
 
   const features = [
-    { key: 'lots',      label: 'Lots de cartes',   fmt: v => v === Infinity ? 'Illimité' : `${v} max` },
-    { key: 'cards',     label: 'Cartes / mois',    fmt: v => v === Infinity ? 'Illimité' : `${v} max` },
-    { key: 'agents',    label: 'Agents',            fmt: v => v === Infinity ? 'Illimité' : `${v} max` },
-    { key: 'csvExport', label: 'Export CSV',        fmt: v => v ? '✅' : '—' },
-    { key: 'stats',     label: 'Statistiques',      fmt: v => v ? '✅' : '—' },
-    { key: 'api',       label: 'API / Webhook',     fmt: v => v ? '✅' : '—' },
+    { key: 'lots',      label: 'Lots de cartes',  fmt: v => v == null ? 'Illimité' : `${v} max` },
+    { key: 'cards',     label: 'Cartes / mois',   fmt: v => v == null ? 'Illimité' : `${v} max` },
+    { key: 'users',     label: 'Utilisateurs',    fmt: v => v == null ? 'Illimité' : `${v} max` },
+    { key: 'csvExport', label: 'Export CSV',       fmt: v => v ? '✅' : '—' },
+    { key: 'stats',     label: 'Statistiques',     fmt: v => v ? '✅' : '—' },
+    { key: 'api',       label: 'API / Webhook',    fmt: v => v ? '✅' : '—' },
   ];
 
-  const planOrder = ['Free', 'Access', 'Regular', 'Pro', 'Enterprise'];
+  const planOrder  = ['Free', 'Access', 'Regular', 'Pro', 'Enterprise'];
   const planColors = {
-    'Free':       'border-gray-200 bg-gray-50',
-    'Access':     'border-blue-200 bg-blue-50',
-    'Regular':    'border-secondary bg-secondary/10',
-    'Pro':        'border-primary bg-primary/10',
-    'Enterprise': 'border-yellow-400 bg-yellow-50',
+    Free:       'border-gray-200 bg-gray-50',
+    Access:     'border-blue-200 bg-blue-50',
+    Regular:    'border-secondary bg-secondary/10',
+    Pro:        'border-primary bg-primary/10',
+    Enterprise: 'border-yellow-400 bg-yellow-50',
+  };
+
+  const handlePay = (planKey) => {
+    if (!tenant) return;
+    const plan = PLANS[planKey];
+    if (!plan || plan.price === null) {
+      window.open('mailto:commercial@kadolink.app?subject=Plan%20Enterprise%20KadoLink', '_blank');
+      return;
+    }
+    if (plan.price === 0) {
+      activatePlanLocally(tenant.id, 'Free', 'free-downgrade');
+      const tenants = Storage.gget('tenants') || [];
+      const up = tenants.find(t => t.id === tenant.id);
+      if (up) setTenant(up);
+      setPayState('success');
+      setPayMsg('Votre plan a été mis à jour vers Free.');
+      return;
+    }
+    setPayState('loading');
+    setPayMsg('');
+    const opts = { tenant, planKey, planPrice: plan.price, userEmail: user?.email || '', userName: user?.name || tenant.name };
+    const onSuccess = ({ txRef, planKey: pk, gateway: gw }) => {
+      const inv = activatePlanLocally(tenant.id, pk, txRef);
+      const tenants = Storage.gget('tenants') || [];
+      const up = tenants.find(t => t.id === tenant.id);
+      if (up) setTenant(up);
+      setPayInvoice(inv);
+      setPayState('success');
+      setPayMsg(`Plan ${pk} activé avec succès ! (${gw})`);
+    };
+    const onError = (msg) => { setPayState('error'); setPayMsg(msg || 'Une erreur est survenue.'); };
+    if (gateway === 'flutterwave') initFlutterwave(opts, onSuccess, onError);
+    else initCinetPay(opts, onSuccess, onError);
   };
 
   return (
     <div className="p-4 space-y-5 fade-in">
-      {/* Header */}
       <div className="bg-gradient-to-r from-primary to-secondary rounded-2xl p-5 text-white">
         <div className="text-sm opacity-80">🔼 Mise à niveau</div>
         <div className="text-2xl font-black mt-1">Choisissez votre plan</div>
         <div className="text-sm opacity-70 mt-1">Plan actuel : {currentPlan.emoji} {currentPlan.label}</div>
       </div>
 
-      {/* Plans cards */}
+      <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm">
+        <div className="text-xs font-bold text-gray-500 mb-2 uppercase tracking-wide">Mode de paiement</div>
+        <div className="flex gap-2">
+          <button onClick={() => setGateway('cinetpay')}
+            className={`flex-1 py-2 rounded-xl text-xs font-bold transition border-2 ${gateway === 'cinetpay' ? 'bg-primary text-white border-primary' : 'bg-white text-gray-600 border-gray-200 hover:border-primary'}`}>
+            📱 Mobile Money (UEMOA)
+          </button>
+          <button onClick={() => setGateway('flutterwave')}
+            className={`flex-1 py-2 rounded-xl text-xs font-bold transition border-2 ${gateway === 'flutterwave' ? 'bg-secondary text-white border-secondary' : 'bg-white text-gray-600 border-gray-200 hover:border-secondary'}`}>
+            💳 Carte / Internat.
+          </button>
+        </div>
+      </div>
+
+      {payState === 'success' && (
+        <div className="bg-green-50 border border-green-200 rounded-xl p-4 text-sm text-green-800">
+          <div className="font-bold mb-1">✅ {payMsg}</div>
+          {payInvoice && (
+            <div className="text-xs text-green-600">
+              Facture {payInvoice.id} — {payInvoice.amount.toLocaleString()} FCFA
+              <br/>Valable jusqu&apos;au {new Date(payInvoice.periodEnd).toLocaleDateString('fr-FR')}
+            </div>
+          )}
+        </div>
+      )}
+      {payState === 'error' && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-800">
+          ❌ {payMsg}
+        </div>
+      )}
+
       <div className="space-y-3">
         {planOrder.map(planKey => {
           const plan = PLANS[planKey];
-          const isCurrent = (tenant?.plan || 'Free') === planKey;
+          const isCurrent    = (tenant?.plan || 'Free') === planKey;
           const isEnterprise = planKey === 'Enterprise';
+          const isFree       = plan.price === 0;
+          const isLoading    = payState === 'loading';
           return (
             <div key={planKey}
               className={`rounded-2xl p-4 border-2 ${planColors[planKey]} ${isCurrent ? 'ring-2 ring-secondary' : ''}`}>
@@ -3344,7 +3573,7 @@ const UpgradePage = ({ user, setPage }) => {
                   <div>
                     <div className="font-black text-primary text-lg">{plan.label}</div>
                     <div className="text-sm font-bold text-gray-600">
-                      {isEnterprise ? 'Sur devis' : plan.price === 0 ? 'Gratuit' : `${plan.price.toLocaleString()} FCFA / mois`}
+                      {isEnterprise ? 'Sur devis' : isFree ? 'Gratuit' : `${plan.price.toLocaleString()} FCFA / mois`}
                     </div>
                   </div>
                 </div>
@@ -3352,12 +3581,11 @@ const UpgradePage = ({ user, setPage }) => {
                   <span className="text-xs font-bold bg-secondary text-white px-3 py-1 rounded-full">Plan actuel</span>
                 )}
               </div>
-
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 mb-3">
                 {features.map(f => {
-                  const val = f.key === 'lots' ? plan.maxLots :
+                  const val = f.key === 'lots'  ? plan.maxLots :
                               f.key === 'cards' ? plan.maxCards :
-                              f.key === 'agents' ? plan.maxAgents :
+                              f.key === 'users' ? plan.maxUsers :
                               plan[f.key];
                   return (
                     <div key={f.key} className="flex justify-between text-xs py-0.5">
@@ -3367,27 +3595,30 @@ const UpgradePage = ({ user, setPage }) => {
                   );
                 })}
               </div>
-
               {!isCurrent && (
-                <div className="flex gap-2 mt-2">
-                  <a href={CONTACT_WA} target="_blank" rel="noopener"
-                    className="flex-1 text-center py-2 rounded-xl bg-green-500 text-white text-xs font-bold hover:bg-green-600 transition">
-                    💬 WhatsApp
-                  </a>
-                  <a href={CONTACT_MAIL}
-                    className="flex-1 text-center py-2 rounded-xl bg-primary text-white text-xs font-bold hover:bg-primary/90 transition">
-                    ✉️ Email
-                  </a>
-                </div>
+                <button onClick={() => handlePay(planKey)} disabled={isLoading}
+                  className={`w-full py-2.5 rounded-xl text-white text-sm font-bold transition
+                    ${isEnterprise ? 'bg-yellow-500 hover:bg-yellow-600' :
+                      isFree       ? 'bg-gray-400 hover:bg-gray-500' :
+                      gateway === 'flutterwave' ? 'bg-secondary hover:bg-secondary/90' :
+                      'bg-primary hover:bg-primary/90'}
+                    ${isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  {isLoading ? '⏳ Paiement en cours…' :
+                   isEnterprise ? '📧 Nous contacter' :
+                   isFree       ? '⬇️ Passer au Free' :
+                   `💰 Choisir ${plan.label}`}
+                </button>
               )}
             </div>
           );
         })}
       </div>
 
-      {/* Note */}
+      <InvoicesSection tenantId={tenant?.id} />
+
       <div className="bg-amber-50 rounded-xl p-4 border border-amber-200 text-sm text-amber-800">
-        💡 Les changements de plan sont effectifs sous 24h après confirmation du paiement. Contactez-nous pour toute question.
+        💡 Le plan est activé immédiatement après confirmation du paiement.
+        La facture est générée automatiquement et renouvelée chaque mois.
       </div>
 
       {setPage && (
@@ -3396,6 +3627,39 @@ const UpgradePage = ({ user, setPage }) => {
           ← Retour au tableau de bord
         </button>
       )}
+    </div>
+  );
+};
+
+const InvoicesSection = ({ tenantId }) => {
+  if (!tenantId) return null;
+  const invoices = (Storage.gget('invoices') || [])
+    .filter(inv => inv.tenantId === tenantId)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, 10);
+  if (!invoices.length) return null;
+  return (
+    <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm">
+      <div className="text-sm font-bold text-gray-700 mb-3">🧾 Mes factures</div>
+      <div className="space-y-2">
+        {invoices.map(inv => (
+          <div key={inv.id} className="flex items-center justify-between text-xs py-2 border-b border-gray-50 last:border-0">
+            <div>
+              <div className="font-semibold text-gray-800">{inv.id}</div>
+              <div className="text-gray-400">{new Date(inv.createdAt).toLocaleDateString('fr-FR')} — Plan {inv.planKey}</div>
+            </div>
+            <div className="text-right">
+              <div className="font-bold text-gray-800">{(inv.amount || 0).toLocaleString()} FCFA</div>
+              <span className={`px-2 py-0.5 rounded-full text-xs font-bold
+                ${inv.status === 'paid'    ? 'bg-green-100 text-green-700' :
+                  inv.status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                  'bg-red-100 text-red-700'}`}>
+                {inv.status === 'paid' ? '✅ Payée' : inv.status === 'pending' ? '⏳ En attente' : '❌ Annulée'}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 };
