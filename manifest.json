@@ -1,0 +1,8 @@
+{
+  "name": "KadoLink",
+  "short_name": "KadoLink",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#21396D",
+  "background_color": "#ffffff"
+}
